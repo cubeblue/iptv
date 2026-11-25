@@ -57,16 +57,27 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true \
 # 再复制 package 文件并安装依赖
 COPY package*.json ./
 
-# 使用 npm ci 替代 npm install，速度更快且更可靠
-# 如果有 package-lock.json 则使用 ci，否则降级使用 install
-RUN if [ -f package-lock.json ]; then \
-      npm ci --omit=dev; \
-    else \
-      npm install --production; \
-    fi
+# 依赖安装（CLA-1）：只认锁文件、fail-closed。
+#  - package-lock.json 缺失时构建直接失败——不降级成无锁 npm install（那样装的依赖版本不受控）。
+#  - --ignore-scripts：跳过依赖包的生命周期脚本（install/postinstall），未知脚本不得在构建机执行；
+#    本仓库自身无依赖此类脚本的功能。
+RUN if [ ! -f package-lock.json ]; then \
+      echo "错误：缺少 package-lock.json，为保证依赖版本可复现，已中止构建（CLA-1）" >&2; exit 1; \
+    fi \
+  && npm ci --omit=dev --ignore-scripts
 
 # 再复制其他文件（内置台标已在上面单独一层）
+# 敏感运行时文件（system-config.json / users.json / extractors.json 等）由 .dockerignore 排除，绝不进镜像
 COPY --exclude=logo-pack . .
+
+# CLA-1：容器以非 root 用户运行（官方 node 镜像自带 node 用户，uid 1000），缩小被攻破后的影响面。
+# 数据目录归该用户所有；用 `-v ./data:/iptv/data` 或兼容旧路径的 `-v ./data:/migu/data`
+# 绑定宿主机目录时，先对目录执行 `chown -R 1000:1000 ./data`（详见 docs/SECURITY.md）。
+# Chromium 在 utils/browserLauncher.js 已固定 --no-sandbox（容器内一直如此运行，与是否 root 无关）：
+# 本镜像只是普通进程隔离，不提供、也不声称提供宿主机逃逸防护。
+RUN mkdir -p /iptv/data /migu/data \
+  && chown -R node:node /iptv
+USER node
 
 # 默认把运行时配置/数据写到 /iptv/data，并声明为数据卷。
 # 这样即使用户不在 compose 里挂卷，常规 `docker compose pull && up -d` 升级也会

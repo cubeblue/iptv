@@ -7,5 +7,7 @@
   "adminPath": "admin",
   "enableTvgNormalize": true,
   "enableEpgAggregation": true,
-  "_comment": "平台账号 / 画质 / H.265 等内容相关配置自 v4.0.0 起归各抓取模块管理（后台「源管理」对应模块卡片，或存于 extractors.json）；写在本文件里的 userId/token/rateType/enableHDR/enableH265 仅在首次升级时被一次性迁走，之后再改不会生效"
+  "safeLanAllow": "",
+  "enableDouyuSigner": false,
+  "_comment": "平台账号 / 画质 / H.265 等内容相关配置自 v4.0.0 起归各抓取模块管理（后台「源管理」对应模块卡片，或存于 extractors.json）；写在本文件里的 userId/token/rateType/enableHDR/enableH265 仅在首次升级时被一次性迁走，之后再改不会生效。CLA-1 新增：pass 留空时管理后台仅本机可用（fail-closed）；safeLanAllow 是服务器代取局域网/本机地址的精确白名单（主机或主机:端口，逗号分隔，不支持 CIDR/通配，对应环境变量 msafeLanAllow）；enableDouyuSigner 默认 false 禁止执行斗鱼官网下发的动态签名脚本（vm 不是安全边界），需要斗鱼播放时显式开启并自担风险。详见 docs/SECURITY.md"
 }

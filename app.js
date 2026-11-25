@@ -12,7 +12,7 @@ import { epgBuiltToday, scheduleDailyEpgRefresh } from "./utils/dailyEpgRefresh.
 import { resolveUpdateIntervalHours } from "./utils/updateInterval.js";
 import { printBlue, printGreen, printGrey, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
 import { channel, interfaceStr, fetchManifestDirect, rewriteManifest, inlineResolvedManifest } from "./utils/appUtils.js";
-import { toProxyManifest, lookup as lookupProxyTarget, pipeUpstream, probeUpstream, fetchNested, manifestCooling, markManifestResult } from "./utils/hlsProxy.js";
+import { toProxyManifest, lookup as lookupProxyTarget, pipeUpstream, probeUpstream, fetchNested, manifestCooling, markManifestResult, wrapGuardedHook } from "./utils/hlsProxy.js";
 import { dataPath } from "./utils/paths.js";
 import { acceptsGzip, createGzipFileCache } from "./utils/gzipResponse.js";
 import { cachedLogoFile } from "./utils/logoCache.js";
@@ -117,6 +117,27 @@ function isLocalBrowserLoginRequest(req) {
   if (!origin) return true
   try {
     return isLoopbackHost(new URL(origin).hostname)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 判定「请求是否长得像来自本机回环」：TCP 来源是回环、X-Forwarded-For 不指向外网、
+ * Host 是回环名。**注意**：本函数已不再作为管理入口的鉴权依据——本地反向代理可以把公网请求
+ * 伪装成全部三要素齐备（回环来源 + 无 XFF + 回环 Host），TCP 来源证明不了原始调用方。
+ * CLA-1 结论：空密码时管理门整体关闭（见 handleRequest 的 adminGateOk），此函数仅供测试
+ * 与诊断参考。
+ */
+function isLoopbackRequest(req) {
+  const remote = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '')
+  if (remote !== '127.0.0.1' && remote !== '::1') return false
+  // 转发链里任何一跳非回环都拒绝（fail-closed：宁可拦错，不放可疑链）
+  const hops = String(req.headers['x-forwarded-for'] || '').split(',').map(hop => hop.trim().replace(/^::ffff:/, '')).filter(Boolean)
+  if (hops.some(hop => hop !== '127.0.0.1' && hop !== '::1')) return false
+  try {
+    const hostname = new URL(`http://${String(req.headers.host || '')}`).hostname.toLowerCase()
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]'
   } catch {
     return false
   }
@@ -245,16 +266,42 @@ const ICON_ASSETS = Object.freeze({
 })
 try { mkdirSync(LOGOS_DIR, { recursive: true }) } catch (e) { /* 已存在或无法创建，读写时再报 */ }
 
+// CLA-1：请求体上限。后台 API 载荷（含本地粘贴播放列表的 base64 与配置备份导入）都在几 MB 内，
+// 16 MB 留足余量又挡住无界内存累积（chunked 请求没有 Content-Length，只能按实际字节数限流）。
+const MAX_BODY_BYTES = 16 * 1024 * 1024
+
 // 读取请求体（Promise 化，避免回调式写法导致的释放/死锁问题）
 // 注意：必须先把所有 Buffer 块拼接、再整体按 UTF-8 解码。
 // 旧写法 `body += chunk` 是逐块 toString，当一个多字节汉字被拆在两个 TCP 数据块
 // 边界时，两半各自解码会变成乱码（如「咪」→「���」）——自定义分组名含中文且配置体较大时必现。
+// 超过上限：移除监听、继续抽干剩余数据（丢弃不缓冲），以 statusCode=413 拒绝；
+// 调用方按 error.statusCode 回 413。
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    req.on('data', chunk => { chunks.push(chunk) })
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
-    req.on('error', reject)
+    let size = 0
+    const cleanup = () => {
+      req.off('data', onData)
+      req.off('end', onEnd)
+      req.off('error', onError)
+    }
+    const onData = chunk => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        cleanup()
+        req.resume()   // 丢弃后续上传（不再进内存），连接自然结束
+        const error = new Error('请求体过大')
+        error.statusCode = 413
+        reject(error)
+        return
+      }
+      chunks.push(chunk)
+    }
+    const onEnd = () => { cleanup(); resolve(Buffer.concat(chunks).toString('utf8')) }
+    const onError = error => { cleanup(); reject(error) }
+    req.on('data', onData)
+    req.on('end', onEnd)
+    req.on('error', onError)
   })
 }
 
@@ -290,7 +337,10 @@ async function handleRequest(req, res) {
   // passAuthed：站长密码 pass，全权（含后台 / 播放器 / API）。
   // userAuthed：用户访问令牌 /u/<token>，仅内容（进不了后台）。
   // accessPrefix：写回分发链接的前缀，让令牌 / 密码贯穿每个频道与 EPG 地址。
-  let passAuthed = pass === ""
+  // CLA-1：pass 为空时不鉴权**任何人**（含本机回环请求）——本地反向代理可以把公网请求
+  // 伪装成「回环来源 + 回环 Host + 无 XFF」，TCP 来源证明不了原始调用方。空密码等价于
+  // 「管理入口（/admin /api /proxy/web.m3u8）全部关闭」；要管理必须设非空 pass。
+  let passAuthed = false
   let userAuthed = false
   let currentUser = null
   let accessPrefix = ""
@@ -316,7 +366,7 @@ async function handleRequest(req, res) {
     }
   }
 
-  // 站长密码前缀（未走用户令牌时）：pass 为空全部放行；pass 非空只有 /<pass>/... 授权
+  // 站长密码前缀（未走用户令牌时）：只有 /<pass>/... 授权（pass 为空时无任何请求能获得授权）
   if (!userAuthed && pass !== "" && (urlPath === `/${pass}` || urlPath.startsWith(`/${pass}/`))) {
     passAuthed = true
     accessPrefix = `/${pass}`
@@ -334,12 +384,19 @@ async function handleRequest(req, res) {
     return
   }
 
+  // CLA-1：后台入口 fail-closed——只有站长密码（/密码/ 前缀）放行；没设密码一律 403。
+  // 不再接受「本机回环」豁免：本地反向代理可把公网请求伪装成回环来源 + 回环 Host + 无 XFF，
+  // isLoopbackRequest 的三要素证明不了原始调用方（见 utils 审查结论），空密码管理门必须整体关闭。
+  const adminGateOk = passAuthed
+
   // 管理后台路由（路径可自定义，默认 /admin；支持 /<adminPath> 和 /密码/<adminPath>）
   if (routePath === `/${adminPath}`) {
-    if (!passAuthed) {
-      printRed(`管理后台访问需要密码，已拒绝未授权访问`)
+    if (!adminGateOk) {
+      printRed(`管理后台访问被拒绝，已拒绝未授权访问`)
       res.writeHead(403, { 'Content-Type': 'text/html;charset=UTF-8' });
-      res.end(`<html><body><p>访问需要密码，请使用正确的密码路径访问管理后台。</p><p>格式: <code>/你的密码/${adminPath}</code></p></body></html>`);
+      res.end(pass === ""
+        ? `<html><body><p>未设置访问密码：管理后台已停用（安全默认，本机也无法访问）。</p><p>请设置访问密码 <code>mpass</code>（或 system-config.json 的 <code>pass</code>）后重启，再用 <code>/你的密码/${adminPath}</code> 访问，详见 docs/SECURITY.md。</p></body></html>`
+        : `<html><body><p>访问需要密码，请使用正确的密码路径访问管理后台。</p><p>格式: <code>/你的密码/${adminPath}</code></p></body></html>`);
       return
     }
     // 返回管理页面
@@ -373,7 +430,9 @@ async function handleRequest(req, res) {
 
   // 播放器页面路由（支持 /player 和 /密码/player）
   if (routePath === '/player') {
-    if (!passAuthed) {
+    // CLA-1：纯播放页（内容，不是管理入口）。设了密码要 /密码/player；没设密码时照旧公开
+    //（passAuthed 只在非空密码前缀下成立，空密码不会借这里变成任何授权）。
+    if (!passAuthed && pass !== "") {
       res.writeHead(403, { 'Content-Type': 'text/html;charset=UTF-8' });
       res.end(`<html><body><p>访问需要密码，请使用正确的密码路径访问。</p><p>格式: <code>/你的密码/player</code></p></body></html>`);
       return
@@ -395,7 +454,8 @@ async function handleRequest(req, res) {
   if (routePath.startsWith('/api/')) {
     // 鉴权：与页面一致，使用路径中的访问密码（前端在密码模式下会请求 /<pass>/api/...）。
     // 替代旧的、可被伪造的 Referer 头校验。
-    if (!passAuthed) {
+    // CLA-1：只认站长密码前缀（adminGateOk）；未设密码时本机/远程一律 403（fail-closed）
+    if (!adminGateOk) {
       res.writeHead(403, { 'Content-Type': 'application/json;charset=UTF-8' });
       res.end(JSON.stringify({ success: false, message: '未授权访问' }));
       return
@@ -428,8 +488,8 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify(result));
         printGreen(result.success ? "系统配置已保存" : "保存失败")
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -442,8 +502,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify(result));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -455,10 +515,12 @@ async function handleRequest(req, res) {
       return
     }
 
-    // 配置导出/导入（issue #99）：单 JSON 打包，前端触发下载/上传
+    // 配置导出/导入（issue #99）：单 JSON 打包，前端触发下载/上传。
+    // CLA-1：默认导出脱敏版本；?includeSecrets=1 显式导出含敏感数据的完整备份
     if (routePath === '/api/config-backup' && method === 'GET') {
       printBlue("API: 导出配置")
-      const result = exportConfigAPI()
+      const includeSecrets = new URLSearchParams(String(url.split('?')[1] || '')).get('includeSecrets') === '1'
+      const result = exportConfigAPI(includeSecrets)
       res.writeHead(result.success ? 200 : 500, { 'Content-Type': 'application/json;charset=UTF-8' });
       res.end(JSON.stringify(result));
       return
@@ -473,8 +535,8 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify(result));
         printGreen(result.success ? "配置导入完成" : `配置导入失败: ${result.message}`)
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -571,8 +633,8 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify(result));
         printGreen(`外部源${data.action}操作完成`)
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -609,8 +671,8 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify(result));
         printGreen(`EPG 源 ${data.action} 操作完成`)
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -629,8 +691,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify(result));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -651,8 +713,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success || data.action === 'test' ? 200 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify(result));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -680,8 +742,8 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify(result));
         printGreen(`用户 ${data.action} 操作完成`)
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -706,8 +768,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success ? 200 : 500, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify(result));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -733,8 +795,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success ? 200 : 500, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify(result));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -901,8 +963,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success !== false ? 200 : 500, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify({ success: result.success !== false, data: { profileId: pid, disabledSources: list } }));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -915,8 +977,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify(result));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -927,8 +989,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify(result));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -941,8 +1003,8 @@ async function handleRequest(req, res) {
         res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
         res.end(JSON.stringify(result));
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -1053,8 +1115,8 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify(result));
         printGreen("播放列表配置已保存")
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -1085,8 +1147,8 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify(result));
         printGreen(`配置档${data.action}操作完成`)
       } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-        res.end(JSON.stringify({ success: false, message: error.message }));
+        res.writeHead(error?.statusCode === 413 ? 413 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error?.message || String(error) }));
       }
       return
     }
@@ -1221,13 +1283,13 @@ async function handleRequest(req, res) {
   // 后台网页播放自定义源频道：/proxy/web.m3u8?u=<频道原地址>（utils/customSourceProxy.js 的 web 模式）。
   // 第三方地址多数不给网页跨域许可，后台页面和独立播放页拿原地址来问，这里换成该频道的固定引用，
   // 接着走下面的全代理路由，清单和分片都由服务器转发。
-  // 只认用户自己源里已有的地址，不是谁给个地址都替它取；只给站长密码（后台页面用的就是它），
-  // 用户令牌不放行——令牌只该拿到分给它的那份内容。
+  // 只认用户自己源里已有的地址，不是谁给个地址都替它取；只给站长（后台页面用的就是它），
+  // 用户令牌不放行——令牌只该拿到分给它的那份内容。CLA-1：只认站长密码前缀，未设密码一律关闭。
   // 必须排在 relay / 分片 / proxy 这几条路由之前：u 里的原地址若没编码，可能正好长得像它们的路径。
   let webPlayback = false
   const webEntry = routeUrl.match(/^([^?]*)\/proxy\/web\.m3u8\?(.*)$/i)
   if (webEntry) {
-    const ref = passAuthed && !userAuthed
+    const ref = adminGateOk && !userAuthed
       ? customProxyResolver.webRefFor(new URLSearchParams(webEntry[2]).get('u') || '')
       : ''
     if (!ref) {
@@ -1291,9 +1353,10 @@ async function handleRequest(req, res) {
       res.end()
       return
     }
-    const fetchMedia = owner?.fetchProxyMedia
-      ? (url, options) => owner.fetchProxyMedia(target.pid, getModuleConfig(owner.id), url, options)
-      : undefined
+    // CLA-1（审查项 10）：owner 钩子包一层传给分发边界；只有已标记的守卫传输
+    // （如 customSourceProxy）放行，未验证的模块自定义传输在生产 fail closed
+    const fetchMedia = wrapGuardedHook(owner?.fetchProxyMedia,
+      () => (url, options) => owner.fetchProxyMedia(target.pid, getModuleConfig(owner.id), url, options))
     if (method === "HEAD") {
       // 极影视等严格播放器会先 HEAD 第一个分片；向上游取真实 Content-Length / Accept-Ranges。
       // 上游不支持 HEAD 或分片需要转换时 probeUpstream 会回退旧的合成 200，GET 行为不变。
@@ -1558,9 +1621,9 @@ async function handleRequest(req, res) {
     } else {
       const ref = routeUrl.split('?')[0].split('/').filter(Boolean).at(-1).replace(/\.m3u8$/, '')
       const owner = resolverFor(ref)
-      const fetchMedia = owner?.fetchProxyMedia
-        ? (url, options) => owner.fetchProxyMedia(ref, getModuleConfig(owner.id), url, options)
-        : undefined
+      // CLA-1（审查项 10）：与上方全代理分片同一公共分发边界规则
+      const fetchMedia = wrapGuardedHook(owner?.fetchProxyMedia,
+        () => (url, options) => owner.fetchProxyMedia(ref, getModuleConfig(owner.id), url, options))
       manifest = await fetchManifestDirect(result.playURL, result.upstreamHeaders, manifestDiag, result.upstreamFamily, fetchMedia)
       markManifestResult(failKey, manifest != null)
     }
@@ -1913,6 +1976,9 @@ server.listen(port, async () => {
 
   printGreen(`本地地址: http://localhost:${port}${pass == "" ? "" : "/" + pass}`)
   printGreen(`管理平台地址: http://localhost:${port}${pass == "" ? "" : "/" + pass}/${adminPath}`)
+  if (pass === "") {
+    printYellow("⚠ 未设置访问密码（mpass）：管理后台与 API 已停用（安全默认，本机也无法访问；本地反向代理可伪装回环来源，不能作为鉴权依据）。请设置 mpass（或 system-config.json 的 pass）后重启，再用 /你的密码/admin 访问，详见 docs/SECURITY.md")
+  }
   printGreen("开源地址: https://github.com/akiralereal/iptv ")
   if (host != "") {
     printGreen(`自定义地址: ${host}${pass == "" ? "" : "/" + pass}`)
@@ -1926,3 +1992,6 @@ server.listen(port, async () => {
     }
   }
 })
+
+// CLA-1：供测试直接引用（不启动时也要能被 import 检查）
+export { readBody, MAX_BODY_BYTES, isLoopbackRequest }

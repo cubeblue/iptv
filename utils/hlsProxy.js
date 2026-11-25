@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { Readable, Transform } from "node:stream";
 import { printRed, printYellow } from "./colorOut.js";
-import { directFamilyFetch, proxyAwareFetch } from "./systemProxy.js";
+import { systemProxyUrl } from "./systemProxy.js";
+import { assertStaticOutboundUrl, defaultLanAllowlist, readCappedBody, safeFetchDirect, OutboundDeniedError, MAX_MANIFEST_BODY_BYTES } from "./outboundGuard.js";
+import { testFetchInjectionEnabled } from "./testEnv.js";
 
 /**
  * 全代理模式（issue #98 续）：清单里的地址全部改写成「本机同源相对地址」，分片由服务器转发。
@@ -233,6 +235,19 @@ async function discard(response) {
 }
 
 /**
+ * 默认直连出站（模块没给 fetchImpl 时）：本机建立连接 → 全量 DNS 校验 + 固定连接地址
+ * （utils/outboundGuard.js）。
+ * CLA-1：系统代理（HTTPS_PROXY）出站时连接与 DNS 由代理解析，本机无法固定地址 → **fail closed**，
+ * 不静默走代理、也不静默绕过用户代理设置改直连；给出明确错误，见 docs/SECURITY.md。
+ */
+function guardedDirectFetch(url, options = {}) {
+  if (systemProxyUrl()) {
+    throw new Error('检测到系统代理（HTTPS_PROXY）：经代理出站无法固定 DNS 连接（CLA-1 安全默认），HLS 上游取流已拒绝。请在部署环境移除该系统代理、或为该流量配置 NO_PROXY 后重试，详见 docs/SECURITY.md')
+  }
+  return safeFetchDirect(url, { ...options, label: 'HLS 上游' })
+}
+
+/**
  * 代理回源的统一请求入口。动态请求头函数会在每一跳真正发出前收到目标 URL，
  * 因而既能按 Cookie Domain/Path 选头，也能拒绝跳出模块媒体白名单的重定向。
  * 固定对象保持原有行为，只额外限制回源协议为 HTTP(S)。
@@ -251,6 +266,10 @@ async function fetchUpstreamResponse(raw, {
   for (let redirects = 0; redirects <= 3; redirects++) {
     const target = new URL(url)
     if (!['http:', 'https:'].includes(target.protocol)) throw new Error(`不支持的上游协议：${target.protocol}`)
+    // CLA-1：共享出站策略的静态校验（协议 / 内嵌凭据 / 字面 IP / 局域网主机名须在白名单）。
+    // 所有出站路径（含模块注入的 fetchImpl / 代理出站）都过这一关；直连出站的完整 DNS 校验
+    // 与固定连接地址由下方 guardedDirectFetch / safeFetchDirect 完成。
+    assertStaticOutboundUrl(target, { allowlist: defaultLanAllowlist(), label: 'HLS 上游' })
     const generatedHeaders = { ...headersFor(upstreamHeaders, target.href) }
     // 见 UA 常量上方说明：只有函数形态声明的 User-Agent 会发出去，固定对象一律用统一 UA
     const moduleUserAgent = takeUserAgent(generatedHeaders)
@@ -262,9 +281,22 @@ async function fetchUpstreamResponse(raw, {
         if (['authorization', 'cookie', 'proxy-authorization'].includes(name.toLowerCase())) delete generatedHeaders[name]
       }
     }
-    const fetchImpl = upstreamFamily === 4 || upstreamFamily === 6
-      ? (url, options) => directFamilyFetch(url, options, upstreamFamily)
-      : (moduleFetch || proxyAwareFetch)
+    // 出站传输选择（CLA-1）：
+    //  - 显式地址族（IPv6 直连模块）：本机直连，safeFetchDirect 按 family 从已校验的答案里选固定地址；
+    //  - 模块/代理注入的 fetchImpl：连接不由本策略建立，无法固定 DNS → 生产环境 **fail closed**，
+    //    仅在显式测试注入（NODE_ENV=test 且 CLA1_TEST_FETCH_INJECTION=1）下放行，见 docs/SECURITY.md；
+    //  - 默认：guardedDirectFetch（无系统代理 → 校验+固定直连；有系统代理 → 明确报错拒绝）。
+    let fetchImpl
+    if (upstreamFamily === 4 || upstreamFamily === 6) {
+      fetchImpl = (url, options) => safeFetchDirect(url, { ...options, family: upstreamFamily, label: 'HLS 上游' })
+    } else if (moduleFetch) {
+      if (!testFetchInjectionEnabled()) {
+        throw new OutboundDeniedError('HLS 上游自定义出站（模块 fetchImpl / 网络代理）无法固定 DNS 连接（CLA-1 安全默认），已拒绝。见 docs/SECURITY.md「出站请求安全」')
+      }
+      fetchImpl = moduleFetch
+    } else {
+      fetchImpl = guardedDirectFetch
+    }
     const response = await fetchImpl(target.href, {
       method,
       redirect: 'manual',
@@ -312,6 +344,46 @@ function logPipeFail(msg) {
   printYellow(msg)
 }
 
+// ---- CLA-1 公共出站分发边界（审查项 10）----
+// pipeUpstream / probeUpstream / fetchNested / appUtils.fetchHls 的 fetchMedia 参数是
+// 「主清单、子清单、分片、HEAD、密钥」共用的回源钩子，app.js 直接把 owner.fetchProxyMedia
+// 传进来——未经校验的模块钩子会绕过 fetchUpstreamResponse 的守卫（redbull/xumo 的
+// transport.media、sztv 的 liveRelay、heilongjiang/youtube 自定义回源等），等于对任意
+// URL 直接调用不受控传输。生产环境这里只允许：
+//   1. 默认的 fetchUpstreamResponse（其内部：全量 DNS 校验+固定直连 / 系统代理 fail closed /
+//      模块 fetchImpl 仅测试注入放行）；
+//   2. 经 markGuardedTransport 标记的钩子——标记的前提是钩子**自身每请求**都再进
+//      fetchUpstreamResponse 守卫分发（当前只有 customSourceProxy.fetchProxyMedia，标记诚实）；
+// 其余未验证钩子一律 fail closed（明确的拒绝错误，而不是「假校验后交给不受控回调」）。
+// 显式测试注入（NODE_ENV=test 且 CLA1_TEST_FETCH_INJECTION=1，见 utils/testEnv.js）放行，
+// 供离线测试验证钩子机制本身；单设 CLA1_TEST_FETCH_INJECTION=1 不放行。
+const GUARDED_TRANSPORTS = new WeakSet()
+
+/** 标记「自身每请求都经 fetchUpstreamResponse 守卫分发」的传输钩子。 */
+export function markGuardedTransport(fn) {
+  if (typeof fn === 'function') GUARDED_TRANSPORTS.add(fn)
+  return fn
+}
+
+/** 公共分发边界守卫：未标记的钩子在生产一律拒绝（OutboundDeniedError）。 */
+export function assertGuardedTransport(fetchMedia) {
+  if (fetchMedia === undefined || fetchMedia === null || fetchMedia === fetchUpstreamResponse) return
+  if (GUARDED_TRANSPORTS.has(fetchMedia)) return
+  if (testFetchInjectionEnabled()) return
+  throw new OutboundDeniedError('模块自定义出站传输（fetchMedia 钩子）无法固定 DNS 连接（CLA-1 安全默认），已拒绝。见 docs/SECURITY.md「出站请求安全」')
+}
+
+/**
+ * app.js 用：把 owner.fetchProxyMedia 包一层（注入 pid/config）再传给分发边界；
+ * 原钩子已标记时，包装层继承受信标记，否则包装层同样 fail closed。
+ */
+export function wrapGuardedHook(ownerHook, makeWrapper) {
+  if (typeof ownerHook !== 'function') return undefined
+  const wrapped = makeWrapper()
+  if (GUARDED_TRANSPORTS.has(ownerHook)) GUARDED_TRANSPORTS.add(wrapped)
+  return wrapped
+}
+
 /**
  * 把上游分片流式转发给客户端。
  * 返回 { ok, status, bytes, complete, error? }，供调用方输出一次即可判定的诊断日志。
@@ -328,6 +400,7 @@ async function pipeUpstream(url, req, res, transform, upstreamHeaders = {}, upst
   // 只给「拿到响应头」设超时，拿到之后是流式传输，不能再掐
   const timer = setTimeout(() => ctrl.abort(), 15000)
   try {
+    assertGuardedTransport(fetchMedia)   // CLA-1：未验证钩子在生产 fail closed（审查项 10）
     // 要做整片变换时不能把 Range 片段单独交给解码器；回完整 200 对播放器仍合法。
     const headers = !transform && req.headers.range ? { range: req.headers.range } : {}
     const upstream = await fetchMedia(url, { signal: ctrl.signal, upstreamHeaders, upstreamFamily, headers })
@@ -419,6 +492,7 @@ async function probeUpstream(url, req, res, transform, upstreamHeaders = {}, ups
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 10000)
   try {
+    assertGuardedTransport(fetchMedia)   // CLA-1：未验证钩子在生产 fail closed（审查项 10）
     const headers = req.headers.range ? { range: req.headers.range } : {}
     const upstream = await fetchMedia(url, {
       method: 'HEAD',
@@ -455,6 +529,7 @@ async function probeUpstream(url, req, res, transform, upstreamHeaders = {}, ups
     }
   } catch (error) {
     clearTimeout(timer)
+    if (error instanceof OutboundDeniedError) printRed(`全代理 HEAD 探测被拒绝: ${error.message}`)
     return synthetic(error?.name === 'AbortError' ? '上游 HEAD 超时' : `上游 HEAD 失败: ${error?.message || error}`)
   }
 }
@@ -464,13 +539,20 @@ async function fetchNested(url, upstreamHeaders = {}, upstreamFamily, fetchMedia
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 10000)
   try {
+    assertGuardedTransport(fetchMedia)   // CLA-1：未验证钩子在生产 fail closed（审查项 10）
     const resp = await fetchMedia(url, {
       signal: ctrl.signal,
       upstreamHeaders,
       upstreamFamily,
     })
     if (!resp.ok) return null
-    const text = await resp.text()
+    // CLA-1：嵌套子清单正文限流，超限按取回失败处理
+    let text
+    try {
+      text = (await readCappedBody(resp, MAX_MANIFEST_BODY_BYTES, `子清单 ${url}`)).toString('utf8')
+    } catch {
+      return null
+    }
     if (!text.trimStart().startsWith('#EXTM3U')) return null
     return { text, finalUrl: resp.url || url }
   } catch (error) {

@@ -207,6 +207,14 @@ export function mergeSystemConfig(existing, config) {
   if (config.proxy !== undefined) {
     validated.proxy = normalizeProxyUrl(restoreMaskedProxy(config.proxy, existing.proxy))
   }
+  // CLA-1 出站白名单（见 utils/outboundGuard.js）：显式提交才写；条目格式在使用时校验（非法条目忽略并告警）
+  if (config.safeLanAllow !== undefined) {
+    validated.safeLanAllow = String(config.safeLanAllow || '').trim()
+  }
+  // CLA-1：斗鱼动态签名脚本执行默认禁止，显式提交才写（见 extractors/douyu-live/api.js）
+  if (config.enableDouyuSigner !== undefined) {
+    validated.enableDouyuSigner = config.enableDouyuSigner === true
+  }
   return validated
 }
 

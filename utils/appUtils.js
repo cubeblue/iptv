@@ -8,11 +8,12 @@ import { hasSourceFallbackGroups } from "./sourceGroupFallback.js";
 import { resolverFor, listModules, hasModule } from "../extractors/registry.js";
 import { getExtractorManager, getModuleConfig } from "./extractorManager.js";
 import { omitPlayerOnlyOpts } from "./channelOpts.js";
-import { fetchUpstreamResponse } from "./hlsProxy.js";
+import { fetchUpstreamResponse, assertGuardedTransport } from "./hlsProxy.js";
 import { checkModuleBurst } from "./clientScanGuard.js";
 import { isLanHostHeader, proxiedPublicBase } from "./publicOrigin.js";
 import miguDanmaku from "../extractors/migu/danmaku.js";
 import { markFengshowsLiveUrls } from "../extractors/fengshows/channels.js";
+import { readCappedBody, MAX_MANIFEST_BODY_BYTES } from "./outboundGuard.js";
 
 /**
  * 清空各模块的解析缓存。
@@ -86,13 +87,21 @@ function bodySnippet(text) {
 // 失败时把原因写进 diag.reason：此前这里静默返回 null，用户日志只剩一行「取回失败」，
 // CDN 到底回了 403 还是回了一页 HTML，排查者对着日志猜不出来（北京时间电视台就卡在这一步）。
 async function fetchHls(url, signal, upstreamHeaders = {}, diag = {}, upstreamFamily, fetchMedia = fetchUpstreamResponse) {
+  assertGuardedTransport(fetchMedia)   // CLA-1：清单直出的公共分发边界，未验证钩子在生产 fail closed（审查项 10）
   const resp = await fetchMedia(url, {
     signal,
     upstreamHeaders,
     upstreamFamily,
   })
   const type = resp.headers.get('content-type') || '未知类型'
-  const text = await resp.text()
+  // CLA-1：清单正文按实际字节数限流（不只看 Content-Length），超限视同取回失败
+  let text = ''
+  try {
+    text = (await readCappedBody(resp, MAX_MANIFEST_BODY_BYTES, `清单 ${urlForLog(resp.url || url)}`)).toString('utf8')
+  } catch (error) {
+    diag.reason = `上游 ${urlForLog(resp.url || url)} ${error?.message || error}`
+    return null
+  }
   if (!resp.ok) {
     diag.reason = `上游 ${urlForLog(resp.url || url)} 回 HTTP ${resp.status}（${type}）${text.trim() ? ` 正文: ${bodySnippet(text)}` : ''}`
     return null

@@ -4,6 +4,7 @@ import vm from 'node:vm'
 import fetch from 'node-fetch'
 import { qualityFrom } from '../../utils/qualityOverride.js'
 import { isWatchTogetherFilm } from '../watchTogether.js'
+import { enableDouyuSigner } from '../../config.js'
 
 export const DOUYU_GROUP = '斗鱼'
 export const REFERER = 'https://m.douyu.com/'
@@ -205,13 +206,18 @@ export async function fetchRoom(roomRef, options = {}) {
 }
 
 /**
- * 执行移动官网下发的动态签名函数。
+ * 执行移动官网下发的动态签名函数（默认禁止，见下方开关）。
  *
- * 斗鱼会轮换 crptext，签名函数本身还会解开几段短代码；把某一版算法硬抄进仓库会
- * 很快失效。这里只在无 Node/网络/文件对象的 vm 上下文里开放 MD5，并给整个编译+
- * 调用设 1 秒硬超时。输出随后按字段白名单校验，远端脚本不能决定请求地址或方法。
+ * 安全事实（不要以为它安全）：node:vm 的 runInNewContext **不是安全边界**，斗鱼官网下发的
+ * crptext 是随页面轮换的任意脚本，即使只在上下文里开放 MD5、加 1 秒超时、按字段白名单校验
+ * 输出，也无法证明或保证脚本不会利用 vm 逃逸（历史上 Node 出过多次 vm 逃逸 CVE）。
+ * 因此该功能默认关闭（config.js 的 enableDouyuSigner / menableDouyuSigner 显式开启，
+ * 自担风险）。关闭时斗鱼频道的列表抓取不受影响，只有「生成播放签名」这一步会明确报错。
  */
 export function createMobileSign(signerCode, roomId, did = ANONYMOUS_DID, timestamp = Math.floor(Date.now() / 1000)) {
+  if (!enableDouyuSigner) {
+    throw new DouyuError('斗鱼播放签名已禁用：签名需要执行斗鱼官网下发的动态脚本，node:vm 不是安全边界，存在远程代码执行风险（默认关闭）。如需启用，请在 system-config.json 设置 enableDouyuSigner: true 或环境变量 menableDouyuSigner=true，并自行评估风险，详见 docs/SECURITY.md')
+  }
   const code = String(signerCode || '')
   const room = normalizeRoom(roomId)
   const device = String(did || '')
@@ -306,6 +312,10 @@ async function resolveFresh(room, ctx) {
 
 export async function resolveRoom(ref, ctx = {}) {
   try {
+    // CLA-1：签名功能默认禁止 → 先于任何网络请求失败，明确告知（见 createMobileSign 的说明）
+    if (!enableDouyuSigner) {
+      return { url: '', desc: '斗鱼播放签名已禁用：签名需要执行斗鱼官网下发的动态脚本，node:vm 不是安全边界（默认关闭）。如需启用请在 system-config.json 设置 enableDouyuSigner: true，自担风险；详见 docs/SECURITY.md' }
+    }
     const match = /^douyu-(\d{1,12})$/.exec(String(ref || ''))
     if (!match) return { url: '', desc: '斗鱼房间引用格式错误' }
     const room = normalizeRoom(match[1])

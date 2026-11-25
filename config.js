@@ -42,7 +42,7 @@ function sanitizeSegment(value, fallback) {
 // ESM 命名导出是实时绑定，重新赋值后所有 import 方都会读到新值。
 // 注意：port、programInfoUpdateInterval 在 server.listen / setInterval 时已被读取，
 // 热更新不会改变已启动的监听端口与定时器周期，这两项仍需重启生效。
-let userId, token, port, host, rateType, debug, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle
+let userId, token, port, host, rateType, debug, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle, safeLanAllow, enableDouyuSigner
 // 内容开关：咪咕核心 / 内置单频道源 / 内置订阅源。默认全开（老用户零感知）
 let enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors
 
@@ -117,6 +117,13 @@ function applyConfig(systemConfig) {
   // 没有对应的 m 开头环境变量：留空时上述模块沿用标准的 HTTPS_PROXY。
   proxy = typeof systemConfig.proxy === 'string' ? systemConfig.proxy.trim() : ""
 
+  // CLA-1 出站白名单：服务器代取「局域网/本机」地址时只允许这里列出的**精确**主机/IP（可带 :端口）。
+  // 无 CIDR / 通配；默认空 = 私网出站一律拒绝。见 utils/outboundGuard.js 与 docs/SECURITY.md
+  safeLanAllow = systemConfig.safeLanAllow ?? process.env.msafeLanAllow ?? ""
+  // CLA-1：斗鱼动态签名脚本（官网下发的 crptext）在 vm 里执行不是安全边界，默认禁止；
+  // 需要斗鱼直播播放的部署显式开启并自担风险（见 docs/SECURITY.md）
+  enableDouyuSigner = systemConfig.enableDouyuSigner !== undefined ? systemConfig.enableDouyuSigner : parseBool(process.env.menableDouyuSigner, false)
+
   // 空白模式总开关：开启后下面三项内容开关「默认」翻转为关（一行得到空白 docker）。
   // 优先级：细粒度开关显式值 > 总开关推出的默认 > 全开。所以可 mblank=true + menableMigu=true 单独留咪咕。
   const blank = parseBool(systemConfig.blank ?? process.env.mblank, false)
@@ -144,7 +151,7 @@ applyConfig(loadSystemConfig())
 // 重新加载系统配置（保存系统配置后调用，避免必须重启进程）
 function reloadConfig() {
   applyConfig(loadSystemConfig())
-  return { userId, token, port, host, rateType, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors }
+  return { userId, token, port, host, rateType, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle, safeLanAllow, enableDouyuSigner, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors }
 }
 
-export { userId, token, port, host, rateType, debug, pass, enableHDR, programInfoUpdateInterval, enableH265, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle, CCTV_LOGO_STYLES, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors, reloadConfig, sanitizeSegment }
+export { userId, token, port, host, rateType, debug, pass, enableHDR, programInfoUpdateInterval, enableH265, refreshToken, adminPath, externalLogoBase, externalLogoIndex, enableTvgNormalize, enableEpgAggregation, enableLogoCache, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, proxy, cctvLogoStyle, CCTV_LOGO_STYLES, safeLanAllow, enableDouyuSigner, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors, reloadConfig, sanitizeSegment }

@@ -8565,7 +8565,7 @@
                         ${items.map(it => `
                         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border:1px solid var(--ui-line);border-radius:5px;margin-bottom:4px;">
                             <span style="min-width:0;word-break:break-all;">${escapeHtml(it.name)}</span>
-                            <button class="btn btn-sm" style="flex-shrink:0;" onclick="closeMissingLogoModal(); showChannelDetail('${String(it.id).replace(/'/g, "\\'")}', false)">补台标</button>
+                            <button class="btn btn-sm" style="flex-shrink:0;" onclick="closeMissingLogoModal(); showChannelDetail('${escapeInlineJs(it.id)}', false)">补台标</button>
                         </div>`).join('')}
                     </div>`).join('');
             }
@@ -8742,7 +8742,8 @@
                 
                 const navItem = document.createElement('div');
                 navItem.className = 'category-nav-item' + (currentCategory === index ? ' active' : '');
-                navItem.innerHTML = `${category.name}<span class="count">${category.dataList.length}</span>`;
+                // CLA-1：分组名来自订阅/抓取内容（第三方数据），按 HTML 文本转义后拼接
+                navItem.innerHTML = `${escapeHtml(category.name)}<span class="count">${category.dataList.length}</span>`;
                 navItem.onclick = () => selectCategory(index);
                 categoryContainer.appendChild(navItem);
             });
@@ -8784,11 +8785,12 @@
                 // 显示所有频道
                 allChannels.forEach(category => {
                     if (!category.dataList || category.dataList.length === 0) return;
-                    
+
                     category.dataList.forEach(channel => {
                         const channelDiv = document.createElement('div');
                         channelDiv.className = 'channel-item';
-                        channelDiv.innerHTML = channel.name;
+                        // CLA-1：频道名是第三方订阅数据，用 textContent 渲染，绝不进 innerHTML
+                        channelDiv.textContent = channel.name;
                         channelDiv.dataset.categoryName = category.name;
                         channelDiv.dataset.channelName = channel.name;
                         container.appendChild(channelDiv);
@@ -8801,7 +8803,8 @@
                     category.dataList.forEach(channel => {
                         const channelDiv = document.createElement('div');
                         channelDiv.className = 'channel-item';
-                        channelDiv.innerHTML = channel.name;
+                        // CLA-1：同上，textContent 渲染
+                        channelDiv.textContent = channel.name;
                         channelDiv.dataset.categoryName = category.name;
                         channelDiv.dataset.channelName = channel.name;
                         container.appendChild(channelDiv);
@@ -9286,8 +9289,9 @@
         
         function renderGroupSelect(index, currentGroup) {
             const groups = getMiguGroups();
-            const options = groups.map(group => 
-                `<option value="${group}" ${group === currentGroup ? 'selected' : ''}>${group}</option>`
+            // CLA-1：分组名可能来自第三方订阅（group-title），value 与文本都按 HTML 属性/文本转义
+            const options = groups.map(group =>
+                `<option value="${escapeHtml(group)}" ${group === currentGroup ? 'selected' : ''}>${escapeHtml(group)}</option>`
             ).join('');
             return `<select onchange="updateExternalField(${index}, 'group', this.value)">${options}</select>`;
         }
@@ -9397,7 +9401,7 @@
                 // 抓取模式：网页地址 -> 自动抓取m3u8
                 detail.innerHTML = `
                     <div class="external-detail-header">
-                        <div class="external-detail-title">${source.name || '未命名源'}</div>
+                        <div class="external-detail-title">${escapeHtml(source.name || '未命名源')}</div>
                         ${statusBadge}
                     </div>
                     ${modeSwitcher}
@@ -9405,7 +9409,7 @@
                         <div class="external-field-row">
                             <div class="external-field">
                                 <label>频道名称 *</label>
-                                <input type="text" value="${source.name || ''}" oninput="updateExternalField(${index}, 'name', this.value)" placeholder="例：体育频道">
+                                <input type="text" value="${escapeHtml(source.name || '')}" oninput="updateExternalField(${index}, 'name', this.value)" placeholder="例：体育频道">
                             </div>
                             <div class="external-field">
                                 <label>所属分组 *</label>
@@ -9414,7 +9418,7 @@
                         </div>
                         <div class="external-field">
                             <label>播放页面地址 *</label>
-                            <input type="text" value="${source.webUrl || ''}" oninput="updateExternalField(${index}, 'webUrl', this.value)" placeholder="例：https://example.com/live.html">
+                            <input type="text" value="${escapeHtml(source.webUrl || '')}" oninput="updateExternalField(${index}, 'webUrl', this.value)" placeholder="例：https://example.com/live.html">
                             <div class="form-hint">填写直播页面地址，点击"抓取并保存"后系统会自动提取m3u8链接</div>
                         </div>
                         <div class="external-field">
@@ -9464,14 +9468,14 @@
                 const fetchFailInfo = fetchFail ? `<div class="form-hint" style="color: #fa8c16;">\u26a0 上次拉取失败（第 ${fetchFail.failCount} 次）：${escapeHtml(String(fetchFail.lastError || '').slice(0, 200))}。${new Date(fetchFail.nextRetryAt).toLocaleTimeString()} 后自动重试</div>` : '';
                 detail.innerHTML = `
                     <div class="external-detail-header">
-                        <div class="external-detail-title">${source.name || '未命名订阅'}</div>
+                        <div class="external-detail-title">${escapeHtml(source.name || '未命名订阅')}</div>
                         ${statusBadge}
                     </div>
                     ${modeSwitcher}
                     <div class="external-detail-body">
                         <div class="external-field">
                             <label>订阅名称 *</label>
-                            <input type="text" value="${source.name || ''}" oninput="updateExternalField(${index}, 'name', this.value)" placeholder="例：广东电视台直播源">
+                            <input type="text" value="${escapeHtml(source.name || '')}" oninput="updateExternalField(${index}, 'name', this.value)" placeholder="例：广东电视台直播源">
                         </div>
                         <div class="external-field">
                             <label>来源 *</label>
@@ -9480,7 +9484,7 @@
                                 <button class="mode-switch-btn ${source.localImport ? 'active' : ''}" onclick="setSubImportType(${index}, true)">本地文件 / 粘贴</button>
                             </div>
                             ${!source.localImport ? `
-                            <input type="text" value="${source.subscriptionUrl || ''}" oninput="updateExternalField(${index}, 'subscriptionUrl', this.value)" placeholder="例：https://example.com/playlist.m3u 或 .txt">
+                            <input type="text" value="${escapeHtml(source.subscriptionUrl || '')}" oninput="updateExternalField(${index}, 'subscriptionUrl', this.value)" placeholder="例：https://example.com/playlist.m3u 或 .txt">
                             <div class="form-hint">填写包含多个频道的 m3u/m3u8 或 txt（频道名,地址）播放列表地址，系统会自动识别格式并解析其中的所有频道</div>
                             ${isFromTheWebUrl(source.subscriptionUrl) ? `
                             <div style="margin-top:8px;padding:8px 10px;background:var(--ui-warning-soft);border:1px solid var(--ui-warning-line);border-radius:4px;font-size:12px;color:var(--ui-warning);line-height:1.6;">
@@ -9579,7 +9583,7 @@
                 // 直连模式：直接填写m3u8链接
                 detail.innerHTML = `
                     <div class="external-detail-header">
-                        <div class="external-detail-title">${source.name || '未命名源'}</div>
+                        <div class="external-detail-title">${escapeHtml(source.name || '未命名源')}</div>
                         ${statusBadge}
                     </div>
                     ${modeSwitcher}
@@ -9587,7 +9591,7 @@
                         <div class="external-field-row">
                             <div class="external-field">
                                 <label>频道名称 *</label>
-                                <input type="text" value="${source.name || ''}" oninput="updateExternalField(${index}, 'name', this.value)" placeholder="例：体育频道">
+                                <input type="text" value="${escapeHtml(source.name || '')}" oninput="updateExternalField(${index}, 'name', this.value)" placeholder="例：体育频道">
                             </div>
                             <div class="external-field">
                                 <label>所属分组 *</label>
@@ -9596,7 +9600,7 @@
                         </div>
                         <div class="external-field">
                             <label>m3u8 直播链接 *</label>
-                            <input type="text" value="${source.m3u8Url || ''}" oninput="updateExternalField(${index}, 'm3u8Url', this.value)" placeholder="例：https://example.com/live.m3u8">
+                            <input type="text" value="${escapeHtml(source.m3u8Url || '')}" oninput="updateExternalField(${index}, 'm3u8Url', this.value)" placeholder="例：https://example.com/live.m3u8">
                             <div class="form-hint">直接填写m3u8直播流地址</div>
                         </div>
                         ${externalProxyField(index, source, { list: false, saveLabel: '保存' })}
@@ -10886,10 +10890,16 @@ if(success){
         }
 
         // ===== 配置备份 / 迁移（issue #99）=====
-        // 导出：拉取聚合配置 JSON，前端触发下载（文件名带日期便于归档）
+        // 导出：拉取聚合配置 JSON，前端触发下载（文件名带日期便于归档）。
+        // CLA-1：默认导出脱敏版本（不含账号 token/访问密码/用户令牌/推送渠道凭据/源配置）；
+        // 用户显式选择后才导出含敏感数据的完整备份
         async function exportConfigBackup() {
             try {
-                const res = await fetch(API_PREFIX + '/api/config-backup');
+                const withSecrets = await showConfirm(
+                    '默认导出不含敏感信息（咪咕账号 token、访问密码、用户令牌、推送渠道凭据、模块登录 Token，以及订阅源/自定义播放列表配置——这些地址里常带签名链接或鉴权头），推荐日常备份用。\n\n注意：默认备份不含订阅源与自定义播放列表，导入后需要重新添加这些源。\n\n点「确定」改为包含全部敏感信息——只在你自己保管这份备份（如换机迁移）时使用；点「取消」导出脱敏版本。',
+                    '导出配置'
+                );
+                const res = await fetch(API_PREFIX + '/api/config-backup' + (withSecrets ? '?includeSecrets=1' : ''));
                 const r = await res.json();
                 if (!r.success) { showStatus(r.message || '导出失败', 'error'); return; }
                 if (r.skipped && r.skipped.length > 0) {
@@ -10906,7 +10916,11 @@ if(success){
                 a.click();
                 document.body.removeChild(a);
                 URL.revokeObjectURL(a.href);
-                showStatus(`已导出 ${Object.keys(r.data.files || {}).length} 个配置文件（含账号密码，注意保管）`, 'success');
+                const fileCount = Object.keys(r.data.files || {}).length;
+                const secretsNote = withSecrets
+                    ? `已导出 ${fileCount} 个配置文件（含敏感信息，请妥善保管）`
+                    : `已导出 ${fileCount} 个配置文件（已脱敏${Array.isArray(r.redacted) && r.redacted.length ? `，未包含：${r.redacted.join('、')}` : ''}；导入后需重新配置账号/密码、订阅源与自定义播放列表）`;
+                showStatus(secretsNote, 'success');
             } catch (e) {
                 showStatus('导出失败: ' + e.message, 'error');
             }
@@ -11314,6 +11328,12 @@ if(success){
 
         function escapeHtml(s) {
             return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+        // 值要嵌进「HTML 属性里的 JS 单引号字符串」（onclick="…'<值>'…"）时用：
+        // 先做 JS 字符串转义（反斜杠、引号、换行），再做 HTML 属性转义。
+        // 只做 escapeHtml 不够——HTML 实体会在 JS 解析前被解码，&#39; 会被还原成能闭合字符串的引号。
+        function escapeInlineJs(s) {
+            return escapeHtml(String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/[\r\n\u2028\u2029]/g, ' '));
         }
         function currentProfileName() {
             const p = profileList.find(x => x.id === activeProfile);
@@ -11725,7 +11745,7 @@ if(success){
                     return `
                     <div class="my-playlist-group-item ${!channelSearchQuery && !isViewingDeleted && selectedGroupIndex === originalIndex ? 'active' : ''}"
                          onclick="selectGroup(${originalIndex}, false)">
-                        <span>${group.name}${mergedCount ? ` <span style="color:#faad14;" title="和订阅源里的同名分组合并显示了，点开看详情">⚠</span>` : ''}</span>
+                        <span>${escapeHtml(group.name)}${mergedCount ? ` <span style="color:#faad14;" title="和订阅源里的同名分组合并显示了，点开看详情">⚠</span>` : ''}</span>
                         <span style="color: var(--ui-subtle); font-size: 12px;">${group.channels.length}</span>
                     </div>
                 `;
@@ -12341,8 +12361,8 @@ if(success){
                     // 完整隐藏分组 · 批量：把选中频道移到可见分组（从隐藏组里捞出来，无需先恢复整组）
                     const selectedCount = selectedChannels.size;
                     const moveOpts = myPlaylistData.map(g => {
-                        const v = String(g.name).replace(/"/g, '&quot;');
-                        return `<option value="${v}">${g.name}</option>`;
+                        // CLA-1：分组名进 <option> 的 value 属性与文本，两处都转义
+                        return `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`;
                     }).join('');
                     actions.innerHTML = `
                         <button class="btn btn-sm" onclick="selectAllChannels()">全选</button>
@@ -12373,20 +12393,20 @@ if(success){
                 container.innerHTML = `
                     <div class="my-playlist-channels">
                         ${group.channels.map(channel => `
-                            <div class="my-playlist-channel deleted ${isBatchMode ? 'batch-mode' : ''} ${isSystemAnnouncementChannel(channel) ? 'system-announcement' : ''} ${channel.id === lastEditedChannelId ? 'recently-edited' : ''}" data-channel-id="${channel.id}">
+                            <div class="my-playlist-channel deleted ${isBatchMode ? 'batch-mode' : ''} ${isSystemAnnouncementChannel(channel) ? 'system-announcement' : ''} ${channel.id === lastEditedChannelId ? 'recently-edited' : ''}" data-channel-id="${escapeHtml(channel.id)}">
                                 ${isBatchMode ? `
                                     <input type="checkbox" class="my-playlist-channel-checkbox"
-                                           onchange="toggleChannelSelection('${channel.id}')"
+                                           onchange="toggleChannelSelection('${escapeInlineJs(channel.id)}')"
                                            ${selectedChannels.has(channel.id) ? 'checked' : ''}>
                                 ` : ''}
                                 ${channelStatusDots(channel)}
-                                <div class="my-playlist-channel-name" title="点击查看详情：${channel.name}" onclick="showChannelDetail('${channel.id}', true)" style="cursor: pointer;">
-                                    <span class="channel-detail-hint" aria-hidden="true">ⓘ</span>${channel.name}
+                                <div class="my-playlist-channel-name" title="点击查看详情：${escapeHtml(channel.name)}" onclick="showChannelDetail('${escapeInlineJs(channel.id)}', true)" style="cursor: pointer;">
+                                    <span class="channel-detail-hint" aria-hidden="true">ⓘ</span>${escapeHtml(channel.name)}
                                 </div>
                                 ${group.isCustomHidden ? '' : hiddenMovedTag(group.name, channel)}
                                 ${group.isPartialDelete && !isBatchMode ? `
                                     <div class="my-playlist-channel-actions" style="opacity: 1 !important;">
-                                        <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); restoreChannel('${channel.id}', '${group.name}')">恢复</button>
+                                        <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); restoreChannel('${escapeInlineJs(channel.id)}', '${escapeInlineJs(group.name)}')">恢复</button>
                                     </div>
                                 ` : ''}
                             </div>
@@ -12415,8 +12435,8 @@ if(success){
                 } else if (isBatchMode) {
                     const selectedCount = selectedChannels.size;
                     const batchMoveOpts = myPlaylistData.map(g => {
-                        const v = String(g.name).replace(/"/g, '&quot;');
-                        return `<option value="${v}">${g.name}</option>`;
+                        // CLA-1：分组名进 <option> 的 value 属性与文本，两处都转义
+                        return `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`;
                     }).join('');
                     actions.innerHTML = `
                         <div class="group-action-grid">
@@ -12463,22 +12483,22 @@ if(success){
                             ${group.channels.map(channel => {
                                 const isProtected = isSystemAnnouncementChannel(channel);
                                 return `
-                                <div class="my-playlist-channel ${isBatchMode ? 'batch-mode' : ''} ${isProtected ? 'system-announcement' : ''} ${channel.id === lastEditedChannelId ? 'recently-edited' : ''}" data-channel-id="${channel.id}"
-                                     ${!isProtected && !isBatchMode && !isNameSorted ? `draggable="true" ondragstart="onChannelDragStart(event, '${channel.id}')" ondragend="onChannelDragEnd(event)" ondragover="onChannelDragOver(event)" ondrop="onChannelDrop(event, '${channel.id}')"` : ''}>
+                                <div class="my-playlist-channel ${isBatchMode ? 'batch-mode' : ''} ${isProtected ? 'system-announcement' : ''} ${channel.id === lastEditedChannelId ? 'recently-edited' : ''}" data-channel-id="${escapeHtml(channel.id)}"
+                                     ${!isProtected && !isBatchMode && !isNameSorted ? `draggable="true" ondragstart="onChannelDragStart(event, '${escapeInlineJs(channel.id)}')" ondragend="onChannelDragEnd(event)" ondragover="onChannelDragOver(event)" ondrop="onChannelDrop(event, '${escapeInlineJs(channel.id)}')"` : ''}>
                                     ${isProtected ? `<span class="channel-drag-handle" aria-hidden="true" title="系统公告固定置顶">🔒</span>` : isBatchMode ? `
                                         <input type="checkbox" class="my-playlist-channel-checkbox"
-                                               onchange="toggleChannelSelection('${channel.id}')"
+                                               onchange="toggleChannelSelection('${escapeInlineJs(channel.id)}')"
                                                ${selectedChannels.has(channel.id) ? 'checked' : ''}>
                                     ` : (isNameSorted ? `<span class="channel-drag-handle" aria-hidden="true"></span>` : `<span class="channel-drag-handle" aria-hidden="true" title="拖拽排序">⠿</span>`)}
                                     ${channelStatusDots(channel)}
-                                    <div class="my-playlist-channel-name" title="点击查看详情：${channel.name}" onclick="showChannelDetail('${channel.id}', false)" style="cursor: pointer;">
-                                        <span class="channel-detail-hint" aria-hidden="true">ⓘ</span>${channel.name}${channelSourceBadge(channel)}${isBatchMode ? '' : sameNameBadge(channel)}
+                                    <div class="my-playlist-channel-name" title="点击查看详情：${escapeHtml(channel.name)}" onclick="showChannelDetail('${escapeInlineJs(channel.id)}', false)" style="cursor: pointer;">
+                                        <span class="channel-detail-hint" aria-hidden="true">ⓘ</span>${escapeHtml(channel.name)}${channelSourceBadge(channel)}${isBatchMode ? '' : sameNameBadge(channel)}
                                     </div>
                                     ${!isBatchMode ? `
                                         <div class="my-playlist-channel-actions">
-                                            ${channel.url ? `<button class="channel-play-btn" title="在页面里播放" onclick="event.stopPropagation(); playInlineById('${channel.id}')">▶ 播放</button>` : ''}
-                                            <button onclick="event.stopPropagation(); hideChannel('${channel.id}')">隐藏</button>
-                                            <button title="以后叫这个名字的频道都不再出现（源换地址也一样）" onclick="event.stopPropagation(); blockChannelByName('${channel.id}')">屏蔽</button>
+                                            ${channel.url ? `<button class="channel-play-btn" title="在页面里播放" onclick="event.stopPropagation(); playInlineById('${escapeInlineJs(channel.id)}')">▶ 播放</button>` : ''}
+                                            <button onclick="event.stopPropagation(); hideChannel('${escapeInlineJs(channel.id)}')">隐藏</button>
+                                            <button title="以后叫这个名字的频道都不再出现（源换地址也一样）" onclick="event.stopPropagation(); blockChannelByName('${escapeInlineJs(channel.id)}')">屏蔽</button>
                                         </div>
                                     ` : ''}
                                 </div>
@@ -13998,7 +14018,7 @@ if(success){
             }
             const count = sameNameCountCache.counts.get(sameNameKey(channel.name)) || 0;
             if (count < 2) return '';
-            return `<span class="same-name-badge" title="播放列表里共有 ${count} 个叫这个名字的频道，点开可以逐条试播、隐藏、调整先后" onclick="event.stopPropagation(); showChannelDetail('${channel.id}', false, { focusSameName: true })">同名×${count}</span>`;
+            return `<span class="same-name-badge" title="播放列表里共有 ${count} 个叫这个名字的频道，点开可以逐条试播、隐藏、调整先后" onclick="event.stopPropagation(); showChannelDetail('${escapeInlineJs(channel.id)}', false, { focusSameName: true })">同名×${count}</span>`;
         }
 
         // 地址的主机名，用来区分同一个源给的几条线路；本机转发的（${replace}/…）不显示

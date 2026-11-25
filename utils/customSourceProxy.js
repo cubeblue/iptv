@@ -30,14 +30,15 @@
  */
 import { createHash } from 'node:crypto'
 import { isIP } from 'node:net'
-import { fetch as undiciFetch } from 'undici'
 
 import { sanitizeOpts } from './channelOpts.js'
+import { testFetchInjectionEnabled } from './testEnv.js'
 import { printYellow } from './colorOut.js'
-import { fetchUpstreamResponse } from './hlsProxy.js'
+import { fetchUpstreamResponse, markGuardedTransport } from './hlsProxy.js'
 import { topVariantFirst } from './hlsTopFirst.js'
 import { isPrivateAddress } from './logoCache.js'
-import { describeProxyFailure, outboundFetch, outboundProxyUrl } from './outboundProxy.js'
+import { describeProxyFailure, outboundProxyUrl } from './outboundProxy.js'
+import { assertStaticOutboundUrl, defaultLanAllowlist, isAllowlistedUrl, resolveAndValidateTarget, safeFetchDirect } from './outboundGuard.js'
 import { stripVolatileParams } from './urlIdentity.js'
 
 export const REF_PREFIX = 'cp-'
@@ -77,6 +78,12 @@ function isLanUrl(raw) {
   try { return isLanHost(new URL(String(raw)).hostname) } catch { return false }
 }
 
+/**
+ * 开了开关的源里的频道地址改写（proxiableUrl）沿用 isLanHost 的宽松口径（198.18/15 fake-ip
+ * 不算局域网）；真正出站时的强制校验在 customSourceFetch / hlsProxy 的共享策略里，两套口径
+ * 各管一段，见 docs/SECURITY.md。
+ */
+
 /** 开了开关的源里，哪些频道改由服务器转发：公网上的 http(s) 地址，FLV 除外（转发链路只管 HLS）。 */
 export function proxiableUrl(raw) {
   let url
@@ -87,20 +94,26 @@ export function proxiableUrl(raw) {
 }
 
 /**
- * 开了开关的源的出站请求：局域网地址直连（代理够不着家里的机器），其余经网络代理
- * （后台填的优先，没填沿用 HTTPS_PROXY / 系统代理，见 outboundProxy.outboundFetch）。
+ * 开了开关的源的出站请求（CLA-1 起先过共享出站策略，见 utils/outboundGuard.js）：
+ *  - 目标在白名单（safeLanAllow / msafeLanAllow 的精确主机/IP）里：本机直连，连接地址固定为
+ *    校验过的解析答案（代理够不着家里的机器）；
+ *  - 其余地址：静态校验（协议 / 内嵌凭据 / 字面 IP / 局域网主机名须在白名单）后经网络代理
+ *    （后台填的优先，没填沿用 HTTPS_PROXY / 系统代理，见 outboundProxy.outboundFetch）。
+ *    经代理出站的连接由代理解析建立、DNS 由代理解析，本机无法固定地址——见 docs/SECURITY.md 的诚实说明。
  */
 export async function customSourceFetch(url, options = {}) {
-  if (isLanUrl(url)) return undiciFetch(url, options)
-  try {
-    return await outboundFetch(url, options)
-  } catch (error) {
-    // 拉订阅那边只认 error.code / cause.code，会把 UND_ERR_SOCKET 原样亮给用户；先翻好挂在错误上
-    if (error && typeof error === 'object' && !error.proxyFailure) {
-      try { error.proxyFailure = describeProxyFailure(error) } catch { /* 只读的错误对象就算了 */ }
-    }
-    throw error
+  const allowlist = defaultLanAllowlist()
+  // CLA-1：出站传输只有两种：
+  //  - 精确白名单（safeLanAllow / msafeLanAllow）里的目标：本机直连，连接地址固定为校验过的答案；
+  //  - 其余目标本应经网络代理——但代理出站时连接与 DNS 由代理解析，本机无法固定地址，
+  //    无法满足「校验过什么就连什么」→ **fail closed**，不静默走代理、也不静默绕过代理改直连。
+  // 静态校验仍先跑一遍，字面私网 IP / 局域网主机名只有白名单能放行。
+  assertStaticOutboundUrl(url, { allowlist, label: '自定义源' })
+  if (isAllowlistedUrl(url, allowlist)) {
+    const pinned = await resolveAndValidateTarget(url, { allowlist, label: '自定义源(白名单直连)' })
+    return safeFetchDirect(url, { ...options, pinned, label: '自定义源(白名单直连)' })
   }
+  throw new Error('「经网络代理转发」出站无法固定 DNS 连接（CLA-1 安全默认），已停用。请取消该源的「经网络代理转发」、或把目标精确加入 safeLanAllow/msafeLanAllow 白名单改由服务器直连；详见 docs/SECURITY.md')
 }
 
 // 代理已接通、往对方那一步失败时，报错后面跟的一句：用户最常见的是把自己网络本来就能播的源（运营商 IPTV 等）也勾上了
@@ -197,8 +210,12 @@ export function createCustomProxyResolver({
   getChannels,
   getWebChannels = () => [],
   getVersion = () => undefined,
-  fetchImpl = customSourceFetch,
-  directFetchImpl = undiciFetch,
+  // CLA-1：经网络代理出站已按安全默认停用（无法固定 DNS 连接），仅显式测试注入
+  // （NODE_ENV=test 且 CLA1_TEST_FETCH_INJECTION=1，见 utils/testEnv.js）下才经 fetchImpl 放行；
+  // 直连（web / 最高画质起播）交给 hlsProxy 的守卫直连（全量 DNS 校验 + 固定连接地址）。
+  // 测试注入的替身由注入方自己负责连接安全
+  fetchImpl,
+  directFetchImpl,
   proxyEnabled = () => Boolean(outboundProxyUrl()),
   log = printYellow,
   now = Date.now,
@@ -275,8 +292,19 @@ export function createCustomProxyResolver({
       // directRedirect：app.js 据此直接 302，不因入口在 /proxy/ 下就改由服务器取清单、转发分片
       return { url, directRedirect: 'no-proxy', desc: `${label} 没有生效的网络代理，改由播放器直连` }
     }
+    if (proxied && !testFetchInjectionEnabled()) {
+      // CLA-1：经网络代理出站无法固定 DNS 连接 → fail closed（不静默绕过用户的代理设置改直连）。
+      // 错误里给出两条出路：取消开关改直连，或把目标精确加入白名单（白名单走校验+固定直连）。
+      // 仅在显式测试注入（NODE_ENV=test 且 CLA1_TEST_FETCH_INJECTION=1）下放行代理传输，供离线测试用。
+      return {
+        url: '', status: 502, silent: true,
+        desc: `${label}「经网络代理转发」出站无法固定 DNS 连接（CLA-1 安全默认），已停用。请取消该源的「经网络代理转发」改由服务器直连，或把目标精确加入 safeLanAllow/msafeLanAllow 白名单；详见 docs/SECURITY.md`,
+      }
+    }
     const upstreamHeaders = upstreamHeadersOf(entry.opts)
     try {
+      // 直连（web 网页播放 / 最高画质起播）：交给 hlsProxy 的守卫直连（全量 DNS 校验 + 固定地址）；
+      // 测试注入的替身由注入方自己负责连接安全
       const response = await fetchUpstreamResponse(url, {
         signal: AbortSignal.timeout(MANIFEST_TIMEOUT_MS),
         upstreamHeaders,
@@ -329,15 +357,21 @@ export function createCustomProxyResolver({
     claimsRef,
     resolve,
     webRefFor,
-    // /proxy 或浏览器全转发模式也遵守源的出站选择；最高画质标记本身不代表启用网络代理。
-    // 网页播放登记的分片也从这里取：没改写入口的频道只在网页名单里
-    fetchProxyMedia: (ref, _config, url, options) => {
+    // /proxy 或浏览器全转发模式的分片回源。CLA-1：经网络代理出站无法固定 DNS 连接 → fail closed；
+    // 直连走 hlsProxy 守卫直连（全量校验 + 固定地址）。
+    // 本钩子**每个请求**都经 fetchUpstreamResponse 守卫分发（生产：无注入 → 校验+固定直连；
+    // 测试注入的 fetchImpl/directFetchImpl 由 fetchUpstreamResponse 内的测试门把关），
+    // 因此打上受信传输标记，允许通过 hlsProxy 公共分发边界（assertGuardedTransport）。
+    fetchProxyMedia: markGuardedTransport((ref, _config, url, options) => {
       const entry = lookup(ref) || lookupWeb(ref)
       if (!entry) throw new Error('自定义源频道已更新，请刷新订阅')
+      if (entry.useProxy === true && proxyEnabled() && !testFetchInjectionEnabled()) {
+        throw new Error('「经网络代理转发」出站无法固定 DNS 连接（CLA-1 安全默认），已停用。详见 docs/SECURITY.md')
+      }
       return fetchUpstreamResponse(url, {
         ...options,
         fetchImpl: entry.useProxy === true && proxyEnabled() ? fetchImpl : directFetchImpl,
       })
-    },
+    }),
   }
 }

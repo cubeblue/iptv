@@ -26,17 +26,32 @@ export const BACKUP_VERSION = 1
 
 // 固定名配置文件白名单（存在才导出；导入只认这些名字）
 const FIXED_FILES = [
-  'system-config.json',        // 含咪咕账号 token 与访问密码（敏感，前端导出时需提示）
-  'external-sources.json',
-  'my-playlist-profiles.json',
-  'my-playlist-config.json',
+  'system-config.json',        // 含咪咕账号 token 与访问密码（敏感，默认导出时剔除敏感键，见下方）
+  'external-sources.json',     // 订阅 URL 常带签名/鉴权头（源配置类，默认整份剔除，见下方）
+  'my-playlist-profiles.json', // 配置档注册表（源配置类，默认整份剔除）
+  'my-playlist-config.json',   // 自定义播放列表地址常带签名/Basic 凭据（源配置类，默认整份剔除）
   'epg-sources.json',
   'channel-aliases.json',
   'group-keyword-rules.json',
   'users.json',
-  'extractors.json',          // 抓取模块的开关与配置（抓取结果在 extractor-cache.json，不进备份）
-  'notify-channels.json',     // 消息推送渠道（含机器人地址 / Token，敏感；推送记录在 notify-state.json，不进备份）
+  'extractors.json',          // 抓取模块的开关与配置（含登录 Token 等敏感值，默认不进备份）
+  'notify-channels.json',     // 消息推送渠道（含机器人地址 / Token，默认不进备份）
 ]
+
+// CLA-1：默认导出**不含**敏感数据（备份文件常被用户四处存放/上传）。
+//  - 敏感文件整份剔除：
+//    - users.json（用户访问令牌）、extractors.json（模块登录 Token）、notify-channels.json（推送机器人 Token）
+//    - 源配置类文件：external-sources.json（订阅 URL 常带签名/鉴权头）、my-playlist-config.json 及
+//      全部配置档 my-playlist-config.<档id>.json（自定义播放列表地址常带签名/Basic 凭据）、
+//      my-playlist-profiles.json（档注册表，随配置档一起缺省保留完整备份才有意义）
+//  - system-config.json 剔除敏感键：userId / token（咪咕账号）、pass（访问密码）、proxy（代理地址可能含凭据）
+// 前端导出时可显式选择「包含敏感信息」（exportConfigAPI(true)）用于换机迁移等自己保管的场景；
+// 导入不做区分——新旧完整备份、脱敏备份都能导入，脱敏备份导入后需重新配置上述凭据与源配置。
+// 注：导入前自动快照 config-pre-import-backup.json 保留在数据目录本机、仍含完整敏感数据（回滚需要它），
+// 请像对待数据目录本身一样保护它，它不会被打进 Docker 镜像（.dockerignore）。
+const SENSITIVE_FILES = ['users.json', 'extractors.json', 'notify-channels.json',
+  'external-sources.json', 'my-playlist-profiles.json', 'my-playlist-config.json']
+const SENSITIVE_SYSTEM_KEYS = ['userId', 'token', 'pass', 'proxy']
 
 // 配置档独立配置的动态文件名：my-playlist-config.<档id>.json。
 // 档 id 全链路只认小写（playlistConfig 的 PROFILE_ID_RE），这里保持同一字符集，
@@ -103,19 +118,39 @@ function refreshRuntime() {
   clearUrlCache()
 }
 
-/** 导出：聚合全部配置为单 JSON（前端负责触发下载） */
-export function exportConfigAPI() {
+/** 导出：聚合全部配置为单 JSON（前端负责触发下载）。默认脱敏；includeSecrets=true 导出完整备份。 */
+export function exportConfigAPI(includeSecrets = false) {
   try {
     const { files, skipped } = collectConfigFiles()
+    const redacted = []
+    if (!includeSecrets) {
+      for (const name of SENSITIVE_FILES) {
+        if (name in files) { delete files[name]; redacted.push(name) }
+      }
+      // 配置档独立配置文件（my-playlist-config.<档id>.json）：按收集到的实际文件名逐个剔除
+      for (const name of Object.keys(files)) {
+        if (PROFILE_FILE_RE.test(name)) { delete files[name]; redacted.push(name) }
+      }
+      if (files['system-config.json'] && typeof files['system-config.json'] === 'object') {
+        for (const key of SENSITIVE_SYSTEM_KEYS) {
+          if (key in files['system-config.json']) {
+            delete files['system-config.json'][key]
+            redacted.push(`system-config.json.${key}`)
+          }
+        }
+      }
+    }
     return {
       success: true,
       data: {
         format: BACKUP_FORMAT,
         version: BACKUP_VERSION,
         exportedAt: new Date().toISOString(),
+        includeSecrets: includeSecrets === true,
         files,
       },
-      skipped,   // 损坏未纳入的文件名（正常为空）
+      skipped,     // 损坏未纳入的文件名（正常为空）
+      redacted,    // 默认脱敏剔除的文件/字段名（前端据此提示）
     }
   } catch (error) {
     return { success: false, message: error.message }

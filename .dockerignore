@@ -19,3 +19,31 @@ data
 # Python bytecode and local device/browser state are runtime data.
 **/__pycache__
 yangshipin
+
+# CLA-1：运行时敏感配置与生成数据绝不进镜像（构建机上误放的真实配置/凭据不被打包）。
+# 这些文件只会出现在数据目录；同名 .example 模板不受影响，照常进镜像供用户参考。
+system-config.json
+users.json
+extractors.json
+notify-channels.json
+epg-sources.json
+external-sources.json
+my-playlist-config.json
+my-playlist-profiles.json
+my-playlist-config.*.json
+channel-aliases.json
+group-keyword-rules.json
+config-pre-import-backup.json
+*.corrupt
+
+# 构建/审查残留与本地环境，不进镜像：
+# - artifacts/：审查与测试日志/证据产物；- .claude/：本地工具配置；
+# - .env*：本地环境变量文件（常含密码/密钥，同名 .example 模板不受影响）；
+# - *.patch / *.diff / evidence/：补丁与证据类审查输出（同名前缀的发布文件不受影响）。
+# 注意：COPY 全量复制 + 黑名单仍有「清单漏写」的残余风险（docs/SECURITY.md 第 6 节有说明）。
+artifacts/
+.claude/
+.env*
+*.patch
+*.diff
+evidence/

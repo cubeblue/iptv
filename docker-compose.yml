@@ -4,7 +4,10 @@ services:
     container_name: iptv                        # 自定义容器名称
     init: true                                  # 用 init 进程回收 Chromium 退出后的僵尸进程
     ports:
-      - "1905:1905"                             # 宿主机:容器端口映射
+      # CLA-1 安全默认：只绑定宿主机回环（本机才能访问）。要开放给局域网/公网时，
+      # 请先设置 mpass 访问密码，再把下面改成 "1905:1905"（或走带 TLS 的反向代理），
+      # 详见 docs/SECURITY.md
+      - "127.0.0.1:1905:1905"
     environment:
       - muserId=                                # 可选：咪咕账号ID（留空为游客模式）
       - mtoken=                                 # 可选：咪咕登录令牌（用于高画质/VIP）
@@ -12,7 +15,7 @@ services:
       - mport=1905                              # 必须：容器监听端口，与 ports 对应
       - mhost=                                  # 可选：外部访问地址（如 http://192.168.1.100:1905）
       - mrateType=3                             # 画质：2=标清(480p)，3=高清(720p)，4=蓝光(1080p,需VIP)
-      - mpass=                                  # 可选：访问密码（设置后访问: http://ip:port/密码/...）
+      - mpass=                                  # 访问密码：不设置时管理后台/API 整体关闭（fail-closed，本机也打不开），要管理请务必设置
       - menableHDR=true                         # 可选：是否开启HDR
       - menableH265=true                        # 可选：是否开启H265原画（可能有兼容性问题）
       - mupdateInterval=6                       # 可选：节目信息更新间隔（小时）

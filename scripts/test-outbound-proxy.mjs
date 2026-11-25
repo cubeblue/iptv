@@ -19,6 +19,11 @@ const DATA_DIR = mkdtempSync(join(tmpdir(), 'iptv-outbound-proxy-'))
 process.env.mdataDir = DATA_DIR
 delete process.env.HTTPS_PROXY
 delete process.env.https_proxy
+// 本测试把模块 fetchProxyMedia（海外/TDM 经代理回源）注入公共分发边界
+// （fetchManifestDirect / fetchNested），属显式测试注入：NODE_ENV=test 且
+// CLA1_TEST_FETCH_INJECTION=1 同时成立才放行（utils/testEnv.js）
+process.env.NODE_ENV = 'test'
+process.env.CLA1_TEST_FETCH_INJECTION = '1'
 
 const { reloadConfig } = await import('../config.js')
 const proxyMod = await import('../utils/outboundProxy.js')

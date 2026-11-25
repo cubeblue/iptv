@@ -22,6 +22,8 @@ import { join } from 'node:path'
 
 const TMP = mkdtempSync(join(tmpdir(), 'iptv-sub-ua-test-'))
 process.env.mdataDir = TMP
+// CLA-1：订阅拉取默认走出站守卫，受控本地服务经显式精确白名单放行（生产配置面 msafeLanAllow）
+process.env.msafeLanAllow = '127.0.0.1'
 
 const { ExternalSourceManager, fetchAndParseM3u } = await import('../utils/externalSources.js')
 const { cleanUserAgent, withUserAgent, userAgentOf, needsOpts } = await import('../utils/channelOpts.js')

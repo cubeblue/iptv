@@ -8,9 +8,10 @@ import { extractM3u8FromWeb, validateM3u8 } from "./webSourceExtractor.js"
 import { collectOptsUntilUrl, cleanUserAgent, withUserAgent } from "./channelOpts.js"
 import { parseCatchupAttrs, resolveCatchup, sanitizeCatchup } from "./channelCatchup.js"
 import { FailureBackoff } from "./refreshBackoff.js"
-import fetch from 'node-fetch'
+import { testFetchInjectionEnabled } from "./testEnv.js"
 import { customSourceFetch, proxiableUrl, proxyRefFor } from "./customSourceProxy.js"
 import { outboundProxyUrl } from "./outboundProxy.js"
+import { createSubscriptionSafeFetch, readCappedBody, MAX_SUBSCRIPTION_BODY_BYTES } from "./outboundGuard.js"
 
 /**
  * 从一行 #EXTINF 提取频道显示名。
@@ -352,7 +353,11 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
  *   GitHub raw 地址不叠加：它失败时本来就会依次换 5 条镜像线路，那就是它的重试
  * @param {number} [options.retryDelayMs] 第 n 次重试前等 n × retryDelayMs，默认 2 秒；测试用来压缩
  */
-async function fetchAndParseM3u(subscriptionUrl, { userAgent, timeoutMs = 15000, retries = 0, retryDelayMs = 2000, fetchImpl = fetch } = {}) {
+// 默认订阅拉取（CLA-1）：直连安全 fetch——全部 DNS 答案校验 + 固定连接地址 + 逐跳重校验，
+// 局域网地址仅精确白名单（safeLanAllow / msafeLanAllow）可访问；测试注入的 fetchImpl 由注入方自己负责
+const guardedSubscriptionFetch = createSubscriptionSafeFetch()
+
+async function fetchAndParseM3u(subscriptionUrl, { userAgent, timeoutMs = 15000, retries = 0, retryDelayMs = 2000, fetchImpl } = {}) {
   const ua = cleanUserAgent(userAgent) || DEFAULT_SUBSCRIPTION_UA
   const attemptMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000
   const isGithubRaw = subscriptionUrl.includes('raw.githubusercontent.com')
@@ -381,7 +386,13 @@ async function fetchAndParseM3u(subscriptionUrl, { userAgent, timeoutMs = 15000,
       const timeoutId = setTimeout(() => controller.abort(), attemptMs)
 
       try {
-        const response = await fetchImpl(targetUrl, {
+        // CLA-1：生产只允许「内置守卫直连」或 customSourceFetch（其自身同样 fail closed：白名单直连/代理停用）。
+        // 其它 fetch 注入仅显式测试环境（NODE_ENV=test 且 CLA1_TEST_FETCH_INJECTION=1，见 utils/testEnv.js）
+        // 放行，杜绝生产路径信任任意注入实现；仅设 CLA1_TEST_FETCH_INJECTION=1 不放行
+        if (fetchImpl && fetchImpl !== customSourceFetch && !testFetchInjectionEnabled()) {
+          throw new Error('订阅拉取的出站 fetch 注入未启用（CLA-1 安全默认）：生产仅允许内置直连或白名单路径，详见 docs/SECURITY.md')
+        }
+        const response = await (fetchImpl || guardedSubscriptionFetch)(targetUrl, {
           signal: controller.signal,
           headers: {
             'User-Agent': ua,
@@ -395,8 +406,9 @@ async function fetchAndParseM3u(subscriptionUrl, { userAgent, timeoutMs = 15000,
           throw error
         }
 
-        // 读原始字节并按编码解码（兼容 GBK/GB2312 订阅，避免分组/频道名乱码）
-        const buffer = Buffer.from(await response.arrayBuffer())
+        // 读原始字节并按编码解码（兼容 GBK/GB2312 订阅，避免分组/频道名乱码）。
+        // CLA-1：按实际字节数限流（不只看 Content-Length——chunked 响应没有长度声明），超限中止
+        const buffer = await readCappedBody(response, MAX_SUBSCRIPTION_BODY_BYTES, `订阅 ${hostOf(targetUrl)}`)
         clearTimeout(timeoutId)
         const content = decodeSubscriptionBody(buffer, response.headers.get('content-type'))
         const channels = parsePlaylistContent(content)

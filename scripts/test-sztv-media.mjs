@@ -5,6 +5,14 @@ import sztv from '../extractors/sztv/index.js'
 import { createMediaFetcher } from '../extractors/sztv/media.js'
 import { pipeUpstream } from '../utils/hlsProxy.js'
 
+// 本测试把模块自定义回源（createMediaFetcher）注入公共分发边界（pipeUpstream），
+// 属显式测试注入：NODE_ENV=test 且 CLA1_TEST_FETCH_INJECTION=1 同时成立才放行（utils/testEnv.js）
+process.env.NODE_ENV = 'test'
+process.env.CLA1_TEST_FETCH_INJECTION = '1'
+// 受控本地服务经生产配置面（msafeLanAllow 精确白名单）放行——模块钩子最终仍走
+// fetchUpstreamResponse，其静态校验要求字面 127.0.0.1 必须精确出现在白名单里
+process.env.msafeLanAllow = '127.0.0.1'
+
 test('深圳媒体：正常 Range、响应头和正文原样通过模块回源入口', async () => {
   const server = http.createServer((req, res) => {
     assert.equal(req.headers.range, 'bytes=0-3')

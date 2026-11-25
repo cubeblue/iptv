@@ -29,6 +29,9 @@ import { join } from 'node:path'
 
 const TMP = mkdtempSync(join(tmpdir(), 'iptv-sub-timeout-test-'))
 process.env.mdataDir = TMP
+// CLA-1：订阅拉取默认走出站守卫（utils/outboundGuard.js）。本测试的受控本地服务
+// 通过显式精确白名单放行——这是生产配置面（msafeLanAllow），不削弱生产默认策略
+process.env.msafeLanAllow = '127.0.0.1'
 
 const { fetchAndParseM3u, subscriptionFetchOptions, subscriptionFailureHint, SUBSCRIPTION_FETCH_LIMITS,
   ExternalSourceManager, BUILT_IN_SUBSCRIPTIONS } = await import('../utils/externalSources.js')

@@ -3,6 +3,10 @@
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { once } from 'node:events'
+
+// CLA-1：HLS 上游默认直连走出站守卫（utils/outboundGuard.js），本测试的受控本地服务
+// （::1 上的源站）经显式精确白名单放行——这是生产配置面（msafeLanAllow），不削弱生产默认策略
+process.env.msafeLanAllow = '127.0.0.1,localhost,[::1]'
 import { directFamilyFetch } from '../utils/systemProxy.js'
 import { register, lookup, toProxyManifest, pipeUpstream, probeUpstream, fetchNested, fetchUpstreamResponse } from '../utils/hlsProxy.js'
 

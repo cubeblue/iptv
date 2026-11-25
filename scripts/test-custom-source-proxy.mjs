@@ -36,10 +36,18 @@ process.env.mexternalLogoBase = ''
 process.env.mexternalLogoIndex = ''
 delete process.env.HTTPS_PROXY
 delete process.env.https_proxy
+// CLA-1：直连路径走出站守卫（utils/outboundGuard.js），本测试的受控本地服务
+// 经显式精确白名单放行——这是生产配置面（msafeLanAllow），不削弱生产默认策略。
+// 代理传输（生产已 fail closed）仅在本测试进程中显式注入（NODE_ENV=test 且
+// CLA1_TEST_FETCH_INJECTION=1，见 utils/testEnv.js），用于验证代理传输本身的机制；
+// 生产代码两个条件缺一时代理路径一律拒绝
+process.env.msafeLanAllow = '127.0.0.1'
+process.env.NODE_ENV = 'test'
+process.env.CLA1_TEST_FETCH_INJECTION = '1'
 
 const { reloadConfig } = await import('../config.js')
 const cp = await import('../utils/customSourceProxy.js')
-const { describeProxyFailure } = await import('../utils/outboundProxy.js')
+const { describeProxyFailure, outboundFetch } = await import('../utils/outboundProxy.js')
 const { default: externalSourceManager, ExternalSourceManager, BUILT_IN_SUBSCRIPTIONS, fetchAndParseM3u, parsePlaylistContent } = await import('../utils/externalSources.js')
 const { startProbe, getProbeStatus } = await import('../utils/sourceProbe.js')
 const { registerRefResolver, resolverFor, listModules } = await import('../extractors/registry.js')
@@ -174,7 +182,9 @@ try {
     seededDefaultSubscriptions: ['https://raw.githubusercontent.com/akiralereal/iptv/main/from-the-web/from-the-web.m3u'],
     retiredBuiltInsV1: true,
     sources: [
-      { id: 'sub00001', name: '海外订阅', mode: 'subscription', enabled: true, useProxy: true, subscriptionUrl: LISTS },
+      { id: 'sub00001', name: '海外订阅', mode: 'subscription', enabled: true, useProxy: true, subscriptionUrl: LISTS,
+        // CLA-1：经代理拉订阅已 fail closed（无法固定 DNS），预置解析结果供后续「频道引用/改写」检查使用
+        parsedChannels: parsePlaylistContent(PLAYLIST) },
       { id: 'sub00002', name: '没勾的订阅', mode: 'subscription', enabled: true, subscriptionUrl: LISTS,
         parsedChannels: [{ name: '直连台', group: '海外', logo: '', url: 'http://cdn.example/live/media.m3u8' }] },
       { id: 'dir00001', name: '直连台A', group: '海外', mode: 'direct', enabled: true, useProxy: true, m3u8Url: 'http://cdn.example/live/media.m3u8?sign=a' },
@@ -185,11 +195,12 @@ try {
   const mgr = new ExternalSourceManager()
   const channelsByName = () => Object.fromEntries(mgr.getValidChannels().flatMap(g => g.dataList).map(c => [c.name, c]))
 
-  await check('拉订阅：勾了开关就经网络代理拉列表', async () => {
+  await check('拉订阅：经网络代理出站无法固定 DNS，按 CLA-1 安全默认拒绝（fail closed）', async () => {
     const r = await mgr.updateSubscriptionSource(0)
-    assert.equal(r.success, true, r.message)
-    assert.ok(connects.includes('lists.example:80'), `代理没收到拉列表的 CONNECT：${connects}`)
-    assert.equal(mgr.sources.sources[0].parsedChannels.length, 7)
+    assert.equal(r.success, false)
+    assert.match(r.message, /无法固定 DNS 连接/)
+    assert.equal(connects.length, 0, '生产语义下代理传输不得被静默使用')
+    assert.equal(mgr.sources.sources[0].parsedChannels.length, 7, '预置的解析结果仍在（后续改写检查用它）')
   })
 
   await check('频道引用：公网 http(s) 才带；没勾的源、抓取模式、内置精选频道都不带', () => {
@@ -228,6 +239,8 @@ try {
     getWebChannels: () => mgr.webPlaybackChannels(),
     getVersion: () => mgr.revision,
     proxyEnabled: () => proxyOn,
+    // 代理传输的显式测试注入（生产 fail closed；本测试进程用 NODE_ENV=test + CLA1_TEST_FETCH_INJECTION=1 放行）
+    fetchImpl: (url, options) => outboundFetch(url, options),
     directFetchImpl: (url, options) => {
       directCalls++
       return directFetch(url.replace('http://cdn.example', localBase), options)
@@ -291,7 +304,8 @@ try {
       { ref: 'cp-00000000000000a2', name: 'CCTV2', url: 'http://gateway.example/live.m3u8', sourceName: '联通', useProxy: true },
     ]
     const lines = []
-    const r2 = cp.createCustomProxyResolver({ getChannels: () => entries, getVersion: () => 1, proxyEnabled: () => true, log: l => lines.push(l) })
+    const r2 = cp.createCustomProxyResolver({ getChannels: () => entries, getVersion: () => 1, proxyEnabled: () => true,
+      fetchImpl: (url, options) => outboundFetch(url, options), log: l => lines.push(l) })
     const cut = await r2.resolve('cp-00000000000000a1', { query: {} })
     assert.equal(cut.status, 502)
     assert.match(cut.desc, /^联通「CCTV1」 经网络代理取清单失败：代理已接通，往对方站点的连接被断开（UND_ERR_SOCKET）。从代理出去连不上这个地址：/)
@@ -301,10 +315,11 @@ try {
     assert.match(gw.desc, /经网络代理取清单失败：代理已接通，但它连不上对方站点（代理回 HTTP 502）。从代理出去/)
     assert.doesNotMatch(gw.desc, /fetch failed|Request was cancelled/)
     assert.ok(lines.some(l => /unreachable\.example/.test(l) && /代理已接通/.test(l)), lines.join('\n'))
-    // 拉订阅经代理失败：卡片和日志上也是这句话，不是错误码
+    // 拉订阅经代理：CLA-1 下 customSourceFetch 对非白名单目标 fail closed（代理无法固定 DNS），
+    // 卡片和日志上看到的是明确的禁用说明，而不是错误码或悄悄直连
     await assert.rejects(
       () => fetchAndParseM3u('http://unreachable.example/sub.m3u', { fetchImpl: cp.customSourceFetch }),
-      error => /代理已接通，往对方站点的连接被断开/.test(error.message),
+      error => /无法固定 DNS 连接/.test(error.message),
     )
     // 认不出是哪一段的（没走代理、或别的错）照旧给原始原因
     assert.deepEqual(describeProxyFailure(new TypeError('fetch failed', { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) }), ''),
@@ -479,7 +494,7 @@ try {
     for (const later of ['const relayMatch = routeUrl.match(', 'const proxySegMatch = routeUrl.match(', 'const proxyMatch = routeUrl.match(']) {
       assert.ok(app.indexOf(later) > entry, `${later} 必须排在网页播放入口之后`)
     }
-    assert.match(app.slice(entry, entry + 400), /passAuthed && !userAuthed/)
+    assert.match(app.slice(entry, entry + 400), /adminGateOk && !userAuthed/)
     assert.match(app, /getWebChannels: \(\) => externalSourceManager\.webPlaybackChannels\(\)/)
     assert.match(app, /web: webPlayback,/)
   })
@@ -516,7 +531,7 @@ try {
     // 隧道可能复用上一项建好的连接，不一定有新的 CONNECT；cdn.example 只有经这个代理才到得了源站
     seen.length = 0
     const r = startProbe(0, '海外订阅', [
-      { name: '代理台', url: 'http://cdn.example/live/media.m3u8', fetchImpl: cp.customSourceFetch },
+      { name: '代理台', url: 'http://cdn.example/live/media.m3u8', fetchImpl: (url, options) => outboundFetch(url, options) },
     ])
     assert.equal(r.success, true)
     for (let i = 0; i < 100 && getProbeStatus().data.state === 'running'; i++) await new Promise(res => setTimeout(res, 50))

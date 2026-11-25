@@ -6,7 +6,9 @@
  *   1) 导出只含白名单配置（含配置档动态名），不含缓存；
  *   2) 导入白名单校验：未知文件名/非对象内容一律跳过，路径穿越名进不来；
  *   3) 导出 → 清空 → 导入 后配置内容逐字节等价（往返无损）；
- *   4) 导入前自动生成 config-pre-import-backup.json 兜底快照。
+ *   4) 导入前自动生成 config-pre-import-backup.json 兜底快照；
+ *   5) CLA-1 默认导出整份剔除源配置类文件（external-sources / my-playlist-config 及配置档 /
+ *      my-playlist-profiles），includeSecrets=true 才完整保留。
  *
  * 用独立临时数据目录跑（mdataDir 在 import 前设置），不碰真实数据。
  * 运行： node scripts/test-config-backup.mjs   （或 npm test）
@@ -49,10 +51,10 @@ const check = (n, fn) => { fn(); passed++; console.log('  ✅ ' + n) }
 
 console.log('配置导出/导入回归测试 (issue #99)')
 
-// 1) 导出：白名单全收、缓存不收
+// 1) 导出：白名单全收、缓存不收；includeSecrets=true 时敏感文件/字段完整保留
 let exported
 check('导出只含白名单配置（含配置档动态名），不含缓存', () => {
-  const r = exportConfigAPI()
+  const r = exportConfigAPI(true)
   assert.equal(r.success, true)
   exported = r.data
   assert.equal(exported.format, BACKUP_FORMAT)
@@ -63,6 +65,34 @@ check('导出只含白名单配置（含配置档动态名），不含缓存', (
   assert.equal(exported.files['my-playlist-config.stray.json'], undefined)
   assert.equal(exported.files['my-playlist-config.OLD.json'], undefined)
   assert.ok(exported.files['my-playlist-config.fam01.json'], '注册档 fam01 应在备份内')
+  assert.equal(exported.includeSecrets, true)
+})
+
+// CLA-1：默认导出脱敏——敏感文件整份剔除（含源配置类：订阅/播放列表地址常带签名与鉴权头）、
+// system-config.json 剔除敏感键；非敏感内容（EPG 源/别名/分组规则）照旧
+check('默认导出脱敏：敏感文件与源配置整份剔除，system-config 无账号/密码/代理', () => {
+  const r = exportConfigAPI()
+  assert.equal(r.success, true)
+  const files = r.data.files
+  assert.equal(files['users.json'], undefined)
+  assert.equal(files['extractors.json'], undefined)
+  assert.equal(files['notify-channels.json'], undefined)
+  assert.equal(files['external-sources.json'], undefined, '订阅源（URL 常带签名/鉴权头）默认不导出')
+  assert.equal(files['my-playlist-config.json'], undefined, '自定义播放列表（地址常带签名/Basic 凭据）默认不导出')
+  assert.equal(files['my-playlist-config.fam01.json'], undefined, '配置档播放列表默认不导出')
+  assert.equal(files['my-playlist-profiles.json'], undefined, '档注册表随配置档一起默认不导出')
+  assert.ok(files['epg-sources.json'], '非敏感文件照旧导出')
+  assert.ok(files['channel-aliases.json'], '非敏感文件照旧导出')
+  const sc = files['system-config.json']
+  assert.equal(sc.userId, undefined)
+  assert.equal(sc.token, undefined)
+  assert.equal(sc.pass, undefined)
+  assert.equal(sc.proxy, undefined)
+  assert.equal(sc.port, 1905, '非敏感键保留')
+  // 只列出「存在且被剔除」的文件/字段（本测试 seed 未创建 extractors.json / notify-channels.json）
+  assert.deepEqual(r.redacted.sort(), ['external-sources.json', 'my-playlist-config.fam01.json',
+    'my-playlist-config.json', 'my-playlist-profiles.json', 'system-config.json.pass',
+    'system-config.json.token', 'system-config.json.userId', 'users.json'].sort())
 })
 
 // 2) 导入白名单：未知名/穿越名/非对象内容全部跳过

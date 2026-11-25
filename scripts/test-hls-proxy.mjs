@@ -20,6 +20,9 @@ import { join } from 'node:path'
 // 数据目录必须在 import 之前定好：paths.js 在模块加载时就读 mdataDir
 const DATA_DIR = mkdtempSync(join(tmpdir(), 'iptv-proxy-test-'))
 process.env.mdataDir = DATA_DIR
+// CLA-1：HLS 上游默认直连走出站守卫（utils/outboundGuard.js），本测试的受控本地服务
+// 经显式精确白名单放行——这是生产配置面（msafeLanAllow），不削弱生产默认策略
+process.env.msafeLanAllow = '127.0.0.1,localhost'
 
 const { toProxyManifest, lookup, register, pipeUpstream, probeUpstream, fetchUpstreamResponse, manifestCooling, markManifestResult, MANIFEST_FAIL_COOLDOWN_MS } = await import('../utils/hlsProxy.js')
 const { fetchManifestDirect, interfaceStr, rewriteManifest } = await import('../utils/appUtils.js')
